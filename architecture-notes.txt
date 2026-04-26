@@ -1,0 +1,190 @@
+================================================================================
+Content Broadcasting System – Architecture Notes
+================================================================================
+
+1. STACK & WHY
+------------------------------------------------------------
+- Node.js + Express (TypeScript)        : industry-standard, lean, easy to deploy
+- PostgreSQL via Supabase (pg driver)   : strict schema, transactional approval
+                                          workflow, easy joins for analytics
+- Supabase Storage                      : managed S3-compatible object store
+                                          (used in place of raw S3 for the bonus)
+- Redis (ioredis)                       : caches /content/live responses (30s
+                                          default) and backs the public-API
+                                          rate limiter. Optional; the app
+                                          degrades gracefully if Redis is down.
+- JWT + bcrypt                          : stateless auth, hashed passwords
+
+2. FOLDER LAYOUT
+------------------------------------------------------------
+src/
+  config/        env, db pool, redis client, supabase storage helper
+  controllers/   thin HTTP layer — parse req, call service, send res
+  routes/        Express routers, mounted under /api
+  services/      business logic (auth, content, approval, scheduling, analytics)
+  models/        data access — single place that talks to Postgres
+  middlewares/   auth, RBAC, multer upload, validate, rate limit, error
+  utils/         JWT, password, scheduler, cache helper, ApiError, asyncHandler
+  db/            schema.sql + migrate.ts + seed.ts
+  types/         module augmentation for Express.Request.user
+
+3. AUTHENTICATION & RBAC FLOW
+------------------------------------------------------------
+- POST /api/auth/register  -> bcrypt hash, stored on users.password_hash
+- POST /api/auth/login     -> compares hash, signs JWT
+                              { sub, email, role, name }, default 7d expiry
+- requireAuth middleware    : reads "Authorization: Bearer <token>", verifies,
+                              attaches req.user
+- requireRole(...allowed)  : per-route gate. Two roles only:
+                              * principal — can list/approve/reject ALL content,
+                                see analytics. Cannot upload.
+                              * teacher   — can upload/list/delete their OWN
+                                content. Cannot approve/reject.
+- Public routes (broadcast) explicitly skip auth.
+- Permissions are enforced both at the router level (requireRole) AND in the
+  service layer (e.g. content.service.getContentForOwnerOrPrincipal also
+  re-checks ownership). Defense in depth.
+
+4. SUBJECT-BASED SYSTEM DESIGN
+------------------------------------------------------------
+- Content is stored with a `subject` text column (lowercased on insert).
+- A `content_slots` table holds one row per subject (unique) — created on demand
+  via getOrCreateSlot when a teacher first uploads to that subject.
+- A `content_schedule` table joins content -> slot, with rotation_order +
+  duration. rotation_order is auto-assigned (max + 1) at insert so teachers
+  don't have to think about ordering.
+- The public broadcast API rotates by SUBJECT, INDEPENDENTLY: each subject's
+  active item is computed from its own anchor and durations. Multiple subjects
+  for the same teacher are returned as parallel "slots" in the response.
+
+5. UPLOAD HANDLING APPROACH
+------------------------------------------------------------
+- multer.memoryStorage() — keep upload in memory (small files ≤ 10MB).
+- mimetype filter restricts to image/jpeg, image/png, image/gif (configurable
+  via ALLOWED_MIME_TYPES).
+- File size limit enforced by multer (MAX_FILE_SIZE_MB, default 10).
+- Successful uploads stream the buffer to Supabase Storage at:
+      <teacher_id>/<timestamp>-<uuid><.ext>
+  We persist BOTH the storage path (for deletion) and the public URL (for
+  serving). The bucket is expected to be PUBLIC-READ.
+- On content delete, the storage object is removed best-effort first, then the
+  DB row. FK ON DELETE CASCADE removes content_schedule + content_views rows.
+
+6. APPROVAL WORKFLOW
+------------------------------------------------------------
+- Teachers cannot self-approve. Only role=principal can hit the approval
+  endpoints.
+- Lifecycle: pending -> approved (rejection_reason cleared, approved_at NOW)
+  pending -> rejected (rejection_reason required, validated server-side)
+- Approval clears any prior rejection_reason — a rejected item can be re-
+  approved if the principal changes their mind.
+- Cache invalidation: on approve/reject, all "live:teacher:<id>:*" cache keys
+  are cleared so the public API reflects the new state immediately.
+
+7. SCHEDULING / ROTATION LOGIC  (VERY IMPORTANT)
+------------------------------------------------------------
+Goal: deterministically pick the currently-active content for a teacher, per
+subject, using only the current wall-clock time. No background jobs needed.
+
+For each public request to /api/content/live/:teacherId[?subject=...]:
+
+  Step 1. Fetch eligible rows for the teacher:
+            status='approved'
+            AND start_time IS NOT NULL AND end_time IS NOT NULL
+            AND start_time <= now < end_time
+          (optionally filtered to a single subject)
+
+  Step 2. Group rows by subject. Each subject is its own rotation cycle.
+
+  Step 3. For each group:
+          - Sort by created_at ASC (stable, deterministic).
+          - anchor = MIN(start_time) across the group. Anchoring at the
+            earliest start_time means rotation phase is stable across server
+            restarts and across replicas.
+          - durations[i] = item.rotation_minutes * 60   (seconds)
+          - cycleLength  = sum(durations)
+          - elapsed      = max(0, now - anchor)
+          - position     = elapsed mod cycleLength
+          - active index = first i where prefixSum(durations, i+1) > position
+          - nextRotationAt = now + (durations[active] - (position - prefixSum<active>))
+
+  Step 4. Return per-subject {active, rotation: {indexInCycle,
+            cycleLength, elapsedInCycle, nextRotationAt, totalInRotation}}.
+
+EDGE CASES (per spec):
+  - No approved content for teacher    -> { slots: [], message: "No content available" }
+  - Approved but outside [start,end]   -> filtered out by Step 1 -> empty
+  - Invalid subject filter             -> Step 1 returns 0 rows -> empty
+  - Invalid teacher id                 -> empty (spec says no error on invalid
+                                          subject; we extend to invalid teacher
+                                          to avoid leaking enumeration data on
+                                          a public endpoint)
+
+The active item is recorded into content_views for analytics (fire-and-forget,
+does NOT block the response).
+
+8. DATABASE DESIGN DECISIONS
+------------------------------------------------------------
+- UUID primary keys via pgcrypto's gen_random_uuid() — good for distributed
+  inserts and cache keys.
+- `content_status` ENUM enforces the lifecycle at the DB level.
+- CHECK constraint `chk_time_window` guarantees start_time < end_time when
+  scheduled, or both NULL.
+- Indexes:
+    users(role)                        - filter principals/teachers
+    content(uploaded_by)               - "my content" listing
+    content(status)                    - principal queues
+    content(subject)                   - subject filters
+    content(start_time, end_time)      - live-window scans
+    content_schedule(slot_id, rotation_order)
+    content_views(subject), (content_id), (teacher_id)
+- Trigger: BEFORE UPDATE on content sets updated_at = NOW().
+
+9. MIDDLEWARE USAGE
+------------------------------------------------------------
+- helmet           — secure HTTP headers
+- cors             — open by default, can be locked down via env if needed
+- morgan('dev')    — request log in non-test environments
+- requireAuth      — JWT extraction + verification, sets req.user
+- requireRole      — declarative role check
+- multer           — single-file upload, mimetype + size limits
+- validate(joi)    — schema validation, mutates req.{body,query,params} to
+                     coerced safe values, surfaces detailed 400 errors
+- publicRateLimiter — express-rate-limit with optional Redis store
+- errorHandler     — centralized: ApiError -> proper status,
+                     MulterError -> 400/413, anything else -> 500
+
+10. SCALABILITY APPROACH
+------------------------------------------------------------
+- Stateless app servers: JWT (no session store), all state in Postgres / Redis
+  / Supabase Storage. Horizontal scale by running N replicas behind a load
+  balancer.
+- Caching: /content/live responses cached in Redis for 30s. Because the
+  rotation algorithm is deterministic against now, multiple replicas computing
+  the same answer don't disagree, and a cache hit is correct.
+  Cache invalidation triggers on:
+    - upload (new content for that teacher)
+    - approve / reject
+    - delete
+- Rate limiting: Redis-backed window limiter on the public endpoint so all
+  replicas share a single counter.
+- File storage: Supabase Storage delivers files via CDN, not the API server.
+- Analytics writes are fire-and-forget — broadcast latency is decoupled from
+  analytics persistence. For higher scale this could be moved to a queue
+  (e.g. BullMQ) and flushed in batches.
+- DB connection pool capped at 10 to avoid exhausting Supabase connection
+  limits (use the Session Pooler URL in production).
+
+11. ASSUMPTIONS / DELIBERATE TRADE-OFFS
+------------------------------------------------------------
+- Users register with their own role. In production, principal accounts would
+  be provisioned by an admin. For the assignment, /auth/register accepts a role
+  to make demo onboarding easy. Lock this down for production.
+- Supabase Storage bucket is public-read. If you need authenticated downloads,
+  switch to signed URLs (supabase.storage.from(bucket).createSignedUrl).
+- A single rotation_minutes per content row is enough; we still mirror it into
+  content_schedule.duration so the schema matches the spec verbatim.
+- start_time and end_time are required to be either both set or both NULL.
+  Without them, content cannot be scheduled and is therefore not broadcast,
+  which matches the spec's "Without start_time/end_time -> content is not
+  active".
